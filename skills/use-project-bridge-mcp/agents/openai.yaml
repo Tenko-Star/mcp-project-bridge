@@ -1,7 +1,7 @@
 interface:
   display_name: "Project Bridge MCP"
-  short_description: "Use shared project messages through MCP"
-  default_prompt: "Use $use-project-bridge-mcp to share and read project messages across connected workspaces."
+  short_description: "Bridge project messages without cross-access"
+  default_prompt: "Use $use-project-bridge-mcp to share and read project messages without operating inside other projects."
 
 dependencies:
   tools:
