@@ -1,0 +1,9 @@
+node_modules
+dist
+coverage
+.git
+.gitignore
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log

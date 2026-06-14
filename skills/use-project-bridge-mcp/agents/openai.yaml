@@ -1,0 +1,11 @@
+interface:
+  display_name: "Project Bridge MCP"
+  short_description: "Use shared project messages through MCP"
+  default_prompt: "Use $use-project-bridge-mcp to share and read project messages across connected workspaces."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "mcp-project-bridge"
+      description: "Local stdio MCP server for shared project messages"
+      transport: "stdio"
