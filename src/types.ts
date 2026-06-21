@@ -1,5 +1,24 @@
 export type DocumentFormat = "markdown" | "text" | "json";
 
+export type ProjectDevice = {
+  deviceId: string;
+  deviceDescription: string | null;
+  createdAt: string;
+  lastSeenAt: string;
+};
+
+export type RegisteredProject = {
+  key: string;
+  remote: string;
+  projectDescription: string | null;
+  createdAt: string;
+  devices: ProjectDevice[];
+};
+
+export type ProjectRegistration = RegisteredProject & {
+  device?: ProjectDevice;
+};
+
 export type MessageVersion = {
   messageId: number;
   versionId: number;

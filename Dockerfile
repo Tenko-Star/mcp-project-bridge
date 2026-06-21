@@ -35,6 +35,7 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 ENV MCP_PROJECT_BRIDGE_DB=/data/bridge.sqlite
+ENV MCP_PROJECT_BRIDGE_HOST=0.0.0.0
 
 RUN mkdir -p /data
 
@@ -43,5 +44,7 @@ COPY --from=build /app/dist ./dist
 COPY package.json README.md ./
 
 VOLUME ["/data"]
+
+EXPOSE 3000
 
 ENTRYPOINT ["node", "dist/index.js"]

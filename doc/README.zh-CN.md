@@ -1,6 +1,6 @@
 # MCP Project Bridge 中文文档
 
-MCP Project Bridge 是一个通过 stdio 运行的 MCP 服务，用本机 SQLite 在多个项目之间保存和读取消息。它适合多项目协作场景，例如一个项目把 API 约定、实现状态、交接说明或结构化备忘发送给另一个项目。
+MCP Project Bridge 是一个通过 Streamable HTTP 运行的 MCP 服务，用本机 SQLite 在多个项目之间保存和读取消息。它适合多项目协作场景，例如一个项目把 API 约定、实现状态、交接说明或结构化备忘发送给另一个项目。
 
 服务只写入自己的集中数据库，不会在被桥接的项目目录里生成文件。
 
@@ -34,20 +34,29 @@ yarn install
 yarn build
 ```
 
-MCP 客户端配置示例：
+启动 Streamable HTTP 服务：
 
-```json
-{
-  "mcpServers": {
-    "project-bridge": {
-      "command": "node",
-      "args": ["D:\\mcp\\mcp-project-bridge\\dist\\index.js"]
-    }
-  }
-}
+```bash
+MCP_PROJECT_BRIDGE_TOKEN=change-me node dist/index.js
 ```
 
-请使用 `dist/index.js` 的绝对路径。Windows 的 JSON 路径需要转义反斜杠。
+PowerShell:
+
+```powershell
+$env:MCP_PROJECT_BRIDGE_TOKEN = "change-me"
+node dist/index.js
+```
+
+服务默认监听 `127.0.0.1:3000`，MCP 端点是 `/mcp`。
+请把 MCP 客户端配置为 Streamable HTTP 端点，例如 `http://127.0.0.1:3000/mcp`，并在每个请求中发送 `Authorization: Bearer change-me`。
+
+HTTP 传输是无状态的：服务不会创建 MCP session，不会返回 `MCP-Session-Id`，也不提供独立的 GET SSE 流。普通请求响应使用 `Content-Type: application/json`。CORS 对浏览器客户端开放为 `Access-Control-Allow-Origin: *`；鉴权仍然依赖 Bearer token。
+
+可选环境变量：
+
+- `MCP_PROJECT_BRIDGE_HOST`：监听地址，默认 `127.0.0.1`
+- `MCP_PROJECT_BRIDGE_PORT`：监听端口，默认 `3000`
+- `MCP_PROJECT_BRIDGE_TOKEN`：必填 Bearer token
 
 ## 数据库位置
 
@@ -58,18 +67,8 @@ MCP 客户端配置示例：
 
 可以用 `MCP_PROJECT_BRIDGE_DB` 指定数据库文件：
 
-```json
-{
-  "mcpServers": {
-    "project-bridge": {
-      "command": "node",
-      "args": ["D:\\mcp\\mcp-project-bridge\\dist\\index.js"],
-      "env": {
-        "MCP_PROJECT_BRIDGE_DB": "D:\\mcp\\project-bridge-data\\bridge.sqlite"
-      }
-    }
-  }
-}
+```bash
+MCP_PROJECT_BRIDGE_TOKEN=change-me MCP_PROJECT_BRIDGE_DB=/data/bridge.sqlite node dist/index.js
 ```
 
 ## Docker 镜像
@@ -80,27 +79,17 @@ MCP 客户端配置示例：
 docker build -t mcp-project-bridge:latest .
 ```
 
-在 MCP 客户端中用 Docker 作为 stdio 服务运行：
+以 Streamable HTTP 服务运行 Docker 镜像：
 
-```json
-{
-  "mcpServers": {
-    "project-bridge": {
-      "command": "docker",
-      "args": [
-        "run",
-        "-i",
-        "--rm",
-        "-v",
-        "mcp-project-bridge-data:/data",
-        "mcp-project-bridge:latest"
-      ]
-    }
-  }
-}
+```bash
+docker run --rm \
+  -p 3000:3000 \
+  -e MCP_PROJECT_BRIDGE_TOKEN=change-me \
+  -v mcp-project-bridge-data:/data \
+  mcp-project-bridge:latest
 ```
 
-镜像默认设置 `MCP_PROJECT_BRIDGE_DB=/data/bridge.sqlite`。挂载 `/data` 后，容器重启不会丢失消息。该服务使用 stdio，不暴露 HTTP 端口。
+镜像默认设置 `MCP_PROJECT_BRIDGE_DB=/data/bridge.sqlite` 和 `MCP_PROJECT_BRIDGE_HOST=0.0.0.0`。挂载 `/data` 后，容器重启不会丢失消息，并可按需映射容器端口。HTTP 端点是 `http://<host>:3000/mcp`。
 
 ## Project Key 规则
 

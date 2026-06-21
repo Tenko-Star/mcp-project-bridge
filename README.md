@@ -2,7 +2,7 @@
 
 [Chinese documentation](doc/README.zh-CN.md)
 
-MCP Project Bridge is a stdio MCP server for sharing project messages through a local SQLite database. It is designed for multi-project workspaces where one project needs to leave structured notes, API contracts, implementation status, or handoff messages for another project.
+MCP Project Bridge is a Streamable HTTP MCP server for sharing project messages through a local SQLite database. It is designed for multi-project workspaces where one project needs to leave structured notes, API contracts, implementation status, or handoff messages for another project.
 
 The server writes only to its own central database. It does not create files inside the projects being bridged.
 
@@ -36,20 +36,29 @@ yarn install
 yarn build
 ```
 
-Configure your MCP client to run the built stdio server:
+Start the Streamable HTTP server:
 
-```json
-{
-  "mcpServers": {
-    "project-bridge": {
-      "command": "node",
-      "args": ["D:\\mcp\\mcp-project-bridge\\dist\\index.js"]
-    }
-  }
-}
+```bash
+MCP_PROJECT_BRIDGE_TOKEN=change-me node dist/index.js
 ```
 
-Use an absolute path to `dist/index.js`. On Windows JSON paths need escaped backslashes.
+On PowerShell:
+
+```powershell
+$env:MCP_PROJECT_BRIDGE_TOKEN = "change-me"
+node dist/index.js
+```
+
+The server listens on `127.0.0.1:3000` by default and exposes the MCP endpoint at `/mcp`.
+Configure your MCP client to use a Streamable HTTP endpoint such as `http://127.0.0.1:3000/mcp`, and send `Authorization: Bearer change-me` on every request.
+
+The HTTP transport is stateless: the server does not create MCP sessions, does not return `MCP-Session-Id`, and does not expose a standalone GET SSE stream. Normal request responses use `Content-Type: application/json`. CORS is open for browser-based clients with `Access-Control-Allow-Origin: *`; authentication still requires the Bearer token.
+
+Optional environment variables:
+
+- `MCP_PROJECT_BRIDGE_HOST`: listen host, default `127.0.0.1`
+- `MCP_PROJECT_BRIDGE_PORT`: listen port, default `3000`
+- `MCP_PROJECT_BRIDGE_TOKEN`: required Bearer token
 
 ## Database Location
 
@@ -60,18 +69,8 @@ By default, the database is stored in the user data directory:
 
 Set `MCP_PROJECT_BRIDGE_DB` to choose a database file:
 
-```json
-{
-  "mcpServers": {
-    "project-bridge": {
-      "command": "node",
-      "args": ["D:\\mcp\\mcp-project-bridge\\dist\\index.js"],
-      "env": {
-        "MCP_PROJECT_BRIDGE_DB": "D:\\mcp\\project-bridge-data\\bridge.sqlite"
-      }
-    }
-  }
-}
+```bash
+MCP_PROJECT_BRIDGE_TOKEN=change-me MCP_PROJECT_BRIDGE_DB=/data/bridge.sqlite node dist/index.js
 ```
 
 ## Docker Image
@@ -82,27 +81,17 @@ Build the image:
 docker build -t mcp-project-bridge:latest .
 ```
 
-Run it as a stdio MCP server from an MCP client:
+Run it as a Streamable HTTP MCP server:
 
-```json
-{
-  "mcpServers": {
-    "project-bridge": {
-      "command": "docker",
-      "args": [
-        "run",
-        "-i",
-        "--rm",
-        "-v",
-        "mcp-project-bridge-data:/data",
-        "mcp-project-bridge:latest"
-      ]
-    }
-  }
-}
+```bash
+docker run --rm \
+  -p 3000:3000 \
+  -e MCP_PROJECT_BRIDGE_TOKEN=change-me \
+  -v mcp-project-bridge-data:/data \
+  mcp-project-bridge:latest
 ```
 
-The image sets `MCP_PROJECT_BRIDGE_DB=/data/bridge.sqlite`, so mount `/data` to keep messages across container restarts. The server uses stdio and does not expose an HTTP port.
+The image sets `MCP_PROJECT_BRIDGE_DB=/data/bridge.sqlite` and `MCP_PROJECT_BRIDGE_HOST=0.0.0.0`, so mount `/data` to keep messages across container restarts and publish the container port as needed. The HTTP endpoint is `http://<host>:3000/mcp`.
 
 ## Project Keys
 

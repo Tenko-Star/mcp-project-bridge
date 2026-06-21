@@ -1,20 +1,27 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { deriveProjectKey, normalizeProjectPathForKey } from "./pathKey.js";
 import { ProjectBridgeStore } from "./storage.js";
 
 const documentFormatSchema = z.enum(["markdown", "text", "json"]);
 const stringArraySchema = z.array(z.string()).optional();
 
-export const deriveProjectKeySchema = z.object({
-  path: z.string().min(1)
+export const registerProjectSchema = z.object({
+  remote: z.string().min(1),
+  deviceId: z.string().min(1).optional(),
+  projectDescription: z.string().min(1).optional(),
+  deviceDescription: z.string().min(1).optional()
+});
+
+export const listProjectsSchema = z.object({
+  query: z.string().min(1).optional(),
+  limit: z.number().int().positive().max(100).optional()
 });
 
 export const upsertMessageSchema = z.object({
-  currentProjectKey: z.string().min(1),
+  currentProjectRemote: z.string().min(1),
   messageId: z.number().int().positive().optional(),
-  targetProjectKey: z.string().nullable().optional(),
+  targetProjectRemote: z.string().nullable().optional(),
   docKey: z.string().min(1),
   title: z.string().min(1).optional(),
   content: z.string().min(1),
@@ -23,13 +30,15 @@ export const upsertMessageSchema = z.object({
 });
 
 export const readUnreadMessagesSchema = z.object({
-  currentProjectKey: z.string().min(1),
+  currentProjectRemote: z.string().min(1),
+  deviceId: z.string().min(1),
   withBroadcast: z.boolean().optional(),
   limit: z.number().int().positive().max(100).optional()
 });
 
 export const listMessagesSchema = z.object({
-  currentProjectKey: z.string().min(1),
+  currentProjectRemote: z.string().min(1),
+  deviceId: z.string().min(1),
   withBroadcast: z.boolean().optional(),
   query: z.string().min(1).optional(),
   tags: stringArraySchema,
@@ -37,7 +46,7 @@ export const listMessagesSchema = z.object({
 });
 
 export const getMessageHistorySchema = z.object({
-  currentProjectKey: z.string().min(1),
+  currentProjectRemote: z.string().min(1),
   messageId: z.number().int().positive(),
   withBroadcast: z.boolean().optional(),
   limit: z.number().int().positive().max(100).optional()
@@ -45,11 +54,11 @@ export const getMessageHistorySchema = z.object({
 
 export function createToolHandlers(store: ProjectBridgeStore) {
   return {
-    deriveProjectKey(input: z.infer<typeof deriveProjectKeySchema>) {
-      return {
-        key: deriveProjectKey(input.path),
-        normalizedPath: normalizeProjectPathForKey(input.path)
-      };
+    registerProject(input: z.infer<typeof registerProjectSchema>) {
+      return store.registerProject(input);
+    },
+    listProjects(input: z.infer<typeof listProjectsSchema>) {
+      return store.listProjects(input);
     },
     upsertMessage(input: z.infer<typeof upsertMessageSchema>) {
       return store.upsertMessage(input);
@@ -71,29 +80,36 @@ export function registerProjectBridgeTools(server: McpServer, store: ProjectBrid
 
   registerJsonTool(
     server,
-    "derive_project_key",
-    "Derive a stable project key from an absolute project path without writing to storage.",
-    deriveProjectKeySchema,
-    handlers.deriveProjectKey
+    "register_project",
+    "Register a Git remote project and optionally upsert the current device for device-scoped reads.",
+    registerProjectSchema,
+    handlers.registerProject
+  );
+  registerJsonTool(
+    server,
+    "list_projects",
+    "List registered Git remote projects and their registered devices.",
+    listProjectsSchema,
+    handlers.listProjects
   );
   registerJsonTool(
     server,
     "upsert_message",
-    "Create or update a direct or broadcast message. If targetProjectKey is omitted, null, or empty, the message is broadcast.",
+    "Create or update a direct or broadcast message. Current and direct target remotes must be registered first.",
     upsertMessageSchema,
     handlers.upsertMessage
   );
   registerJsonTool(
     server,
     "read_unread_messages",
-    "Read unread inbox messages for the current project and mark the returned latest versions as read.",
+    "Read unread inbox messages for a registered project device and mark the returned latest versions as read.",
     readUnreadMessagesSchema,
     handlers.readUnreadMessages
   );
   registerJsonTool(
     server,
     "list_messages",
-    "List latest inbox messages for the current project without changing read state.",
+    "List latest inbox messages for a registered project device without changing read state.",
     listMessagesSchema,
     handlers.listMessages
   );

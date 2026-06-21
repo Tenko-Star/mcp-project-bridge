@@ -1,24 +1,40 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { parseGitRemote } from "./remoteKey.js";
 import type {
   DocumentFormat,
   MessageSearchResult,
   MessageVersion,
+  ProjectDevice,
+  ProjectRegistration,
+  RegisteredProject,
   UnreadMessage
 } from "./types.js";
 
-const MESSAGE_SCHEMA_VERSION = "message-v1";
+const MESSAGE_SCHEMA_VERSION = "remote-message-v1";
 const supportedFormats = new Set<DocumentFormat>(["markdown", "text", "json"]);
 
 type StoreOptions = {
   dbPath: string;
 };
 
+type RegisterProjectInput = {
+  remote: string;
+  deviceId?: string;
+  projectDescription?: string;
+  deviceDescription?: string;
+};
+
+type ListProjectsInput = {
+  query?: string;
+  limit?: number;
+};
+
 type UpsertMessageInput = {
-  currentProjectKey: string;
+  currentProjectRemote: string;
   messageId?: number;
-  targetProjectKey?: string | null;
+  targetProjectRemote?: string | null;
   docKey: string;
   title?: string;
   content: string;
@@ -27,13 +43,15 @@ type UpsertMessageInput = {
 };
 
 type ReadUnreadMessagesInput = {
-  currentProjectKey: string;
+  currentProjectRemote: string;
+  deviceId: string;
   withBroadcast?: boolean;
   limit?: number;
 };
 
 type ListMessagesInput = {
-  currentProjectKey: string;
+  currentProjectRemote: string;
+  deviceId: string;
   withBroadcast?: boolean;
   query?: string;
   tags?: string[];
@@ -41,10 +59,25 @@ type ListMessagesInput = {
 };
 
 type GetMessageHistoryInput = {
-  currentProjectKey: string;
+  currentProjectRemote: string;
   messageId: number;
   withBroadcast?: boolean;
   limit?: number;
+};
+
+type ProjectRow = {
+  key: string;
+  remote: string;
+  project_description: string | null;
+  created_at: string;
+};
+
+type ProjectDeviceRow = {
+  project_key: string;
+  device_id: string;
+  device_description: string | null;
+  created_at: string;
+  last_seen_at: string;
 };
 
 type MessageRow = {
@@ -82,10 +115,6 @@ type SchemaVersionRow = {
   value: string;
 };
 
-type IdRow = {
-  id: number;
-};
-
 type VersionRow = {
   next_version: number;
 };
@@ -107,11 +136,101 @@ export class ProjectBridgeStore {
     this.db.close();
   }
 
+  registerProject(input: RegisterProjectInput): ProjectRegistration {
+    const parsedRemote = parseGitRemote(input.remote);
+    const deviceId = normalizeOptionalString(input.deviceId);
+    const projectDescription = normalizeOptionalString(input.projectDescription) ?? null;
+    const deviceDescription = normalizeOptionalString(input.deviceDescription) ?? null;
+
+    const register = this.db.transaction(() => {
+      const now = new Date().toISOString();
+      const existingProject = this.getProjectRow(parsedRemote.key);
+
+      if (!existingProject) {
+        this.db.prepare(`
+          INSERT INTO projects (key, remote, project_description, created_at)
+          VALUES (@key, @remote, @projectDescription, @createdAt)
+        `).run({
+          key: parsedRemote.key,
+          remote: parsedRemote.remote,
+          projectDescription,
+          createdAt: now
+        });
+      }
+
+      let device: ProjectDevice | undefined;
+      if (deviceId) {
+        this.db.prepare(`
+          INSERT INTO project_devices (
+            project_key,
+            device_id,
+            device_description,
+            created_at,
+            last_seen_at
+          )
+          VALUES (
+            @projectKey,
+            @deviceId,
+            @deviceDescription,
+            @createdAt,
+            @lastSeenAt
+          )
+          ON CONFLICT(project_key, device_id) DO UPDATE SET
+            device_description = CASE
+              WHEN excluded.device_description IS NULL THEN project_devices.device_description
+              ELSE excluded.device_description
+            END,
+            last_seen_at = excluded.last_seen_at
+        `).run({
+          projectKey: parsedRemote.key,
+          deviceId,
+          deviceDescription,
+          createdAt: now,
+          lastSeenAt: now
+        });
+
+        device = mapProjectDeviceRow(this.getDeviceRowOrThrow(parsedRemote.key, deviceId));
+      }
+
+      return {
+        ...this.getRegisteredProject(parsedRemote.key),
+        ...(device ? { device } : {})
+      };
+    });
+
+    return register();
+  }
+
+  listProjects(input: ListProjectsInput = {}): RegisteredProject[] {
+    const query = normalizeOptionalString(input.query);
+    const limit = normalizeOptionalLimit(input.limit);
+    const conditions: string[] = [];
+    const params: Record<string, unknown> = {};
+
+    if (query) {
+      conditions.push("(key LIKE @query OR remote LIKE @query OR COALESCE(project_description, '') LIKE @query)");
+      params.query = `%${query}%`;
+    }
+
+    const limitClause = appendOptionalLimit(params, limit);
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = this.db.prepare(`
+      SELECT key, remote, project_description, created_at
+      FROM projects
+      ${whereClause}
+      ORDER BY key ASC
+      ${limitClause}
+    `).all(params) as ProjectRow[];
+
+    return rows.map((row) => mapProjectRow(row, this.listDevicesForProject(row.key)));
+  }
+
   upsertMessage(input: UpsertMessageInput): MessageVersion {
-    const currentProjectKey = normalizeRequiredKey(input.currentProjectKey, "Current project key is required.");
+    const currentProjectKey = parseGitRemote(input.currentProjectRemote).key;
     const messageId = normalizeOptionalPositiveInteger(input.messageId, "Message id must be a positive integer.");
-    const targetProjectKey = normalizeOptionalString(input.targetProjectKey);
-    const targetProvided = Object.prototype.hasOwnProperty.call(input, "targetProjectKey");
+    const targetRemote = normalizeOptionalString(input.targetProjectRemote);
+    const targetProjectKey = targetRemote ? parseGitRemote(targetRemote).key : undefined;
+    const targetProvided = Object.prototype.hasOwnProperty.call(input, "targetProjectRemote");
     const docKey = normalizeRequiredKey(input.docKey, "Document key is required.");
     const content = normalizeRequiredString(input.content, "Message content is required.");
     const format = input.format;
@@ -121,6 +240,11 @@ export class ProjectBridgeStore {
     }
 
     const saveMessage = this.db.transaction(() => {
+      this.ensureProjectRegistered(currentProjectKey, "Current project");
+      if (targetProjectKey) {
+        this.ensureProjectRegistered(targetProjectKey, "Target project");
+      }
+
       const now = new Date().toISOString();
       const tagsJson = input.tags === undefined ? null : JSON.stringify(normalizeStringArray(input.tags));
       let resolvedMessageId: number;
@@ -236,13 +360,16 @@ export class ProjectBridgeStore {
   }
 
   readUnreadMessages(input: ReadUnreadMessagesInput): UnreadMessage[] {
-    const currentProjectKey = normalizeRequiredKey(input.currentProjectKey, "Current project key is required.");
+    const currentProjectKey = parseGitRemote(input.currentProjectRemote).key;
+    const deviceId = normalizeRequiredKey(input.deviceId, "Device id is required.");
     const limit = normalizeOptionalLimit(input.limit);
     const includeBroadcast = input.withBroadcast === true;
-    const params: Record<string, unknown> = { currentProjectKey };
+    const params: Record<string, unknown> = { currentProjectKey, deviceId };
     const limitClause = appendOptionalLimit(params, limit);
 
     const readMessages = this.db.transaction(() => {
+      this.ensureDeviceRegistered(currentProjectKey, deviceId);
+
       const rows = this.db.prepare(`
         SELECT
           m.id AS message_id,
@@ -270,6 +397,7 @@ export class ProjectBridgeStore {
         LEFT JOIN message_reads r
           ON r.message_version_id = v.id
          AND r.viewer_project_key = @currentProjectKey
+         AND r.viewer_device_id = @deviceId
         WHERE m.sender_project_key <> @currentProjectKey
           AND ${inboxVisibilityCondition(includeBroadcast)}
           AND r.read_at IS NULL
@@ -283,15 +411,16 @@ export class ProjectBridgeStore {
 
       const viewedAt = new Date().toISOString();
       const markRead = this.db.prepare(`
-        INSERT INTO message_reads (viewer_project_key, message_version_id, read_at)
-        VALUES (@viewerProjectKey, @messageVersionId, @readAt)
-        ON CONFLICT(viewer_project_key, message_version_id) DO UPDATE SET
+        INSERT INTO message_reads (viewer_project_key, viewer_device_id, message_version_id, read_at)
+        VALUES (@viewerProjectKey, @viewerDeviceId, @messageVersionId, @readAt)
+        ON CONFLICT(viewer_project_key, viewer_device_id, message_version_id) DO UPDATE SET
           read_at = excluded.read_at
       `);
 
       rows.forEach((row) => {
         markRead.run({
           viewerProjectKey: currentProjectKey,
+          viewerDeviceId: deviceId,
           messageVersionId: row.version_id,
           readAt: viewedAt
         });
@@ -308,7 +437,8 @@ export class ProjectBridgeStore {
   }
 
   listMessages(input: ListMessagesInput): MessageSearchResult[] {
-    const currentProjectKey = normalizeRequiredKey(input.currentProjectKey, "Current project key is required.");
+    const currentProjectKey = parseGitRemote(input.currentProjectRemote).key;
+    const deviceId = normalizeRequiredKey(input.deviceId, "Device id is required.");
     const includeBroadcast = input.withBroadcast === true;
     const query = normalizeOptionalString(input.query);
     const tags = normalizeStringArray(input.tags ?? []);
@@ -317,7 +447,9 @@ export class ProjectBridgeStore {
       "m.sender_project_key <> @currentProjectKey",
       inboxVisibilityCondition(includeBroadcast)
     ];
-    const params: Record<string, unknown> = { currentProjectKey };
+    const params: Record<string, unknown> = { currentProjectKey, deviceId };
+
+    this.ensureDeviceRegistered(currentProjectKey, deviceId);
 
     if (query) {
       conditions.push("(m.doc_key LIKE @query OR m.title LIKE @query OR v.content LIKE @query)");
@@ -353,6 +485,7 @@ export class ProjectBridgeStore {
       LEFT JOIN message_reads r
         ON r.message_version_id = v.id
        AND r.viewer_project_key = @currentProjectKey
+       AND r.viewer_device_id = @deviceId
       WHERE ${conditions.join(" AND ")}
       ORDER BY v.created_at DESC, v.id DESC
       ${limitClause}
@@ -371,12 +504,13 @@ export class ProjectBridgeStore {
   }
 
   getMessageHistory(input: GetMessageHistoryInput): MessageVersion[] {
-    const currentProjectKey = normalizeRequiredKey(input.currentProjectKey, "Current project key is required.");
+    const currentProjectKey = parseGitRemote(input.currentProjectRemote).key;
     const messageId = normalizeOptionalPositiveInteger(input.messageId, "Message id must be a positive integer.");
     if (messageId === undefined) {
       throw new Error("Message id is required.");
     }
 
+    this.ensureProjectRegistered(currentProjectKey, "Current project");
     const message = this.getMessageRowOrThrow(messageId);
     this.ensureMessageAccessible(message, currentProjectKey, input.withBroadcast === true);
     const limit = normalizeOptionalLimit(input.limit);
@@ -434,10 +568,26 @@ export class ProjectBridgeStore {
     }
 
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS projects (
+        key TEXT PRIMARY KEY NOT NULL,
+        remote TEXT NOT NULL,
+        project_description TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS project_devices (
+        project_key TEXT NOT NULL REFERENCES projects(key) ON UPDATE CASCADE ON DELETE CASCADE,
+        device_id TEXT NOT NULL,
+        device_description TEXT,
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        PRIMARY KEY(project_key, device_id)
+      );
+
       CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sender_project_key TEXT NOT NULL,
-        target_project_key TEXT,
+        sender_project_key TEXT NOT NULL REFERENCES projects(key) ON UPDATE CASCADE ON DELETE RESTRICT,
+        target_project_key TEXT REFERENCES projects(key) ON UPDATE CASCADE ON DELETE RESTRICT,
         doc_key TEXT NOT NULL,
         title TEXT,
         format TEXT NOT NULL DEFAULT 'markdown',
@@ -451,16 +601,21 @@ export class ProjectBridgeStore {
         message_id INTEGER NOT NULL REFERENCES messages(id) ON UPDATE CASCADE ON DELETE CASCADE,
         version INTEGER NOT NULL,
         content TEXT NOT NULL,
-        author_project_key TEXT NOT NULL,
+        author_project_key TEXT NOT NULL REFERENCES projects(key) ON UPDATE CASCADE ON DELETE RESTRICT,
         created_at TEXT NOT NULL,
         UNIQUE(message_id, version)
       );
 
       CREATE TABLE IF NOT EXISTS message_reads (
         viewer_project_key TEXT NOT NULL,
+        viewer_device_id TEXT NOT NULL,
         message_version_id INTEGER NOT NULL REFERENCES message_versions(id) ON UPDATE CASCADE ON DELETE CASCADE,
         read_at TEXT NOT NULL,
-        PRIMARY KEY(viewer_project_key, message_version_id)
+        PRIMARY KEY(viewer_project_key, viewer_device_id, message_version_id),
+        FOREIGN KEY(viewer_project_key, viewer_device_id)
+          REFERENCES project_devices(project_key, device_id)
+          ON UPDATE CASCADE
+          ON DELETE CASCADE
       );
 
       CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_direct_unique
@@ -470,6 +625,12 @@ export class ProjectBridgeStore {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_broadcast_unique
         ON messages(sender_project_key, doc_key)
         WHERE target_project_key IS NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_projects_remote
+        ON projects(remote);
+
+      CREATE INDEX IF NOT EXISTS idx_project_devices_last_seen
+        ON project_devices(project_key, last_seen_at);
 
       CREATE INDEX IF NOT EXISTS idx_messages_inbox
         ON messages(target_project_key, updated_at);
@@ -496,13 +657,73 @@ export class ProjectBridgeStore {
       DROP TABLE IF EXISTS message_reads;
       DROP TABLE IF EXISTS message_versions;
       DROP TABLE IF EXISTS messages;
+      DROP TABLE IF EXISTS project_devices;
+      DROP TABLE IF EXISTS projects;
       DROP TABLE IF EXISTS doc_view_states;
       DROP TABLE IF EXISTS bridge_doc_versions;
       DROP TABLE IF EXISTS bridge_docs;
       DROP TABLE IF EXISTS project_links;
-      DROP TABLE IF EXISTS projects;
       DELETE FROM schema_metadata WHERE key = 'schema_version';
     `);
+  }
+
+  private getRegisteredProject(projectKey: string): RegisteredProject {
+    const project = this.getProjectRow(projectKey);
+    if (!project) {
+      throw new Error(`Project is not registered: ${projectKey}.`);
+    }
+
+    return mapProjectRow(project, this.listDevicesForProject(projectKey));
+  }
+
+  private getProjectRow(projectKey: string): ProjectRow | undefined {
+    return this.db.prepare(`
+      SELECT key, remote, project_description, created_at
+      FROM projects
+      WHERE key = @projectKey
+    `).get({ projectKey }) as ProjectRow | undefined;
+  }
+
+  private ensureProjectRegistered(projectKey: string, label: string): void {
+    if (!this.getProjectRow(projectKey)) {
+      throw new Error(`${label} is not registered: ${projectKey}. Call register_project first.`);
+    }
+  }
+
+  private ensureDeviceRegistered(projectKey: string, deviceId: string): void {
+    this.ensureProjectRegistered(projectKey, "Current project");
+    if (!this.getDeviceRow(projectKey, deviceId)) {
+      throw new Error(`Device is not registered for project ${projectKey}: ${deviceId}. Call register_project first.`);
+    }
+  }
+
+  private listDevicesForProject(projectKey: string): ProjectDevice[] {
+    const rows = this.db.prepare(`
+      SELECT project_key, device_id, device_description, created_at, last_seen_at
+      FROM project_devices
+      WHERE project_key = @projectKey
+      ORDER BY device_id ASC
+    `).all({ projectKey }) as ProjectDeviceRow[];
+
+    return rows.map(mapProjectDeviceRow);
+  }
+
+  private getDeviceRow(projectKey: string, deviceId: string): ProjectDeviceRow | undefined {
+    return this.db.prepare(`
+      SELECT project_key, device_id, device_description, created_at, last_seen_at
+      FROM project_devices
+      WHERE project_key = @projectKey
+        AND device_id = @deviceId
+    `).get({ projectKey, deviceId }) as ProjectDeviceRow | undefined;
+  }
+
+  private getDeviceRowOrThrow(projectKey: string, deviceId: string): ProjectDeviceRow {
+    const device = this.getDeviceRow(projectKey, deviceId);
+    if (!device) {
+      throw new Error(`Device is not registered for project ${projectKey}: ${deviceId}.`);
+    }
+
+    return device;
   }
 
   private findMessageByIdentity(senderProjectKey: string, targetProjectKey: string | undefined, docKey: string): MessageRow | undefined {
@@ -658,6 +879,25 @@ function parseStringArray(json: string): string[] {
 function createPreview(content: string): string {
   const compact = content.replace(/\s+/g, " ").trim();
   return compact.length <= 240 ? compact : `${compact.slice(0, 237)}...`;
+}
+
+function mapProjectRow(row: ProjectRow, devices: ProjectDevice[]): RegisteredProject {
+  return {
+    key: row.key,
+    remote: row.remote,
+    projectDescription: row.project_description,
+    createdAt: row.created_at,
+    devices
+  };
+}
+
+function mapProjectDeviceRow(row: ProjectDeviceRow): ProjectDevice {
+  return {
+    deviceId: row.device_id,
+    deviceDescription: row.device_description,
+    createdAt: row.created_at,
+    lastSeenAt: row.last_seen_at
+  };
 }
 
 function mapMessageVersionRow(row: MessageVersionRow): MessageVersion {

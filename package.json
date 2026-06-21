@@ -1,7 +1,7 @@
 {
   "name": "mcp-project-bridge",
   "version": "0.1.0",
-  "description": "A stdio MCP server that bridges shared project documents without writing into project directories.",
+  "description": "A Streamable HTTP MCP server that bridges shared project documents without writing into project directories.",
   "type": "module",
   "packageManager": "yarn@1.22.22",
   "bin": {

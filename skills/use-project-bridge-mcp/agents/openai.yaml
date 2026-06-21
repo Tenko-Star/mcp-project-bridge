@@ -7,5 +7,5 @@ dependencies:
   tools:
     - type: "mcp"
       value: "mcp-project-bridge"
-      description: "Local stdio MCP server for shared project messages"
-      transport: "stdio"
+      description: "Local Streamable HTTP MCP server for shared project messages"
+      transport: "streamable-http"
