@@ -2,23 +2,32 @@
 
 [Chinese documentation](doc/README.zh-CN.md)
 
-MCP Project Bridge is a Streamable HTTP MCP server for sharing project messages through a local SQLite database. It is designed for multi-project workspaces where one project needs to leave structured notes, API contracts, implementation status, or handoff messages for another project.
+MCP Project Bridge is a Streamable HTTP MCP server for sharing messages between registered Git remote projects through a central SQLite database. It is designed for multi-project or multi-device work where one project needs to leave structured notes, API contracts, implementation status, or handoff messages for another project.
 
 The server writes only to its own central database. It does not create files inside the projects being bridged.
 
 ## How It Works
 
-Each project is represented by a project key. You can provide your own key, or derive a stable key from an absolute project path with `derive_project_key`.
+Projects are identified by Git remotes, not local paths. A project must be registered before it can send, receive, or inspect messages.
+
+On registration, the server parses the Git remote into a canonical key:
+
+- The canonical key is a single lower-case string in `host/namespace/project` style.
+- Multi-level namespaces are preserved, such as `github.com/org/team/repo`.
+- The database stores the original remote from the first registration.
+- Later registrations of the same canonical key do not overwrite the original remote or project description.
+- The key is not an alias system. Different remote strings only refer to the same project when they canonicalize to the same key.
 
 Messages are stored in a central inbox model:
 
 - A direct message has a sender project key, a target project key, and a `docKey`.
+- A direct target must already be registered, otherwise the write fails.
 - A broadcast message has a sender project key and a `docKey`, with no target project key.
 - Reusing the same sender, target, and `docKey` creates a new version of the same message.
 - Passing `messageId` updates that message, but only the sender project can update it.
-- Read state is tracked per viewer project and per message version.
-- `read_unread_messages` marks only the returned latest versions as read.
-- A later message version becomes unread again for projects that have not read that version.
+- Read state is tracked per viewer project, per `deviceId`, and per message version.
+- `read_unread_messages` marks only the returned latest versions as read for that device.
+- A later message version becomes unread again for devices that have not read that version.
 
 Broadcast messages are hidden from normal inbox reads unless `withBroadcast: true` is passed.
 
@@ -52,7 +61,7 @@ node dist/index.js
 The server listens on `127.0.0.1:3000` by default and exposes the MCP endpoint at `/mcp`.
 Configure your MCP client to use a Streamable HTTP endpoint such as `http://127.0.0.1:3000/mcp`, and send `Authorization: Bearer change-me` on every request.
 
-The HTTP transport is stateless: the server does not create MCP sessions, does not return `MCP-Session-Id`, and does not expose a standalone GET SSE stream. Normal request responses use `Content-Type: application/json`. CORS is open for browser-based clients with `Access-Control-Allow-Origin: *`; authentication still requires the Bearer token.
+The HTTP transport is stateless: the server does not create MCP sessions, does not return `MCP-Session-Id`, and does not expose a standalone GET SSE stream. Normal request responses use `Content-Type: application/json`. `GET /mcp` and `DELETE /mcp` return `405`. CORS is open for browser-based clients with `Access-Control-Allow-Origin: *`; authentication still requires the Bearer token and credentials/cookies are not used.
 
 Optional environment variables:
 
@@ -93,31 +102,63 @@ docker run --rm \
 
 The image sets `MCP_PROJECT_BRIDGE_DB=/data/bridge.sqlite` and `MCP_PROJECT_BRIDGE_HOST=0.0.0.0`, so mount `/data` to keep messages across container restarts and publish the container port as needed. The HTTP endpoint is `http://<host>:3000/mcp`.
 
-## Project Keys
+## Remote Key Rules
 
-`derive_project_key` normalizes Windows drive paths into WSL-style paths before replacing path separators with underscores.
+Use a Git remote URL when calling tools. The server canonicalizes it and stores the resulting project key.
 
 Examples:
 
 ```text
-D:\mcp\api -> /mnt/d/mcp/api -> _mnt_d_mcp_api
-C:/work\frontend -> /mnt/c/work/frontend -> _mnt_c_work_frontend
-/home/me/web -> _home_me_web
+https://github.com/Org/Repo.git -> github.com/org/repo
+git@github.com:Org/Repo.git -> github.com/org/repo
+ssh://git@github.com/org/team/Repo.git -> github.com/org/team/repo
 ```
 
-Project keys are just message identifiers. They do not need to be registered before use.
+Rules:
+
+- The remote must include a host, namespace, and project.
+- The canonical key is lower-case and keeps `/` separators.
+- The database stores the original remote string only on first project registration.
+- Tool inputs use remotes such as `currentProjectRemote` and `targetProjectRemote`; callers should send remotes, not local paths or legacy path-based keys.
 
 ## Tools
 
-### `derive_project_key`
+### `register_project`
 
-Derive a stable project key from an absolute project path without writing to storage.
+Register a Git remote project and optionally upsert the current device.
 
 ```json
 {
-  "path": "D:\\workspace\\backend"
+  "remote": "https://github.com/example/backend.git",
+  "deviceId": "desktop",
+  "projectDescription": "Backend service",
+  "deviceDescription": "Windows desktop"
 }
 ```
+
+`deviceId` is optional. Registering a target project before a direct send can use only `remote` and `projectDescription`.
+
+```json
+{
+  "remote": "git@github.com:example/frontend.git",
+  "projectDescription": "Frontend app"
+}
+```
+
+On first registration, the project remote and project description are saved. Later registrations of the same canonical key only upsert device information when `deviceId` is provided.
+
+### `list_projects`
+
+List registered projects and device summaries. Use this to discover valid direct targets.
+
+```json
+{
+  "query": "frontend",
+  "limit": 20
+}
+```
+
+`query` matches the canonical key, original remote, or project description.
 
 ### `upsert_message`
 
@@ -125,8 +166,8 @@ Create or update a direct or broadcast message.
 
 ```json
 {
-  "currentProjectKey": "_mnt_d_workspace_backend",
-  "targetProjectKey": "_mnt_d_workspace_frontend",
+  "currentProjectRemote": "https://github.com/example/backend.git",
+  "targetProjectRemote": "git@github.com:example/frontend.git",
   "docKey": "users-api",
   "title": "Users API",
   "content": "GET /users\nPOST /users",
@@ -135,11 +176,13 @@ Create or update a direct or broadcast message.
 }
 ```
 
-Omit `targetProjectKey`, pass `null`, or pass an empty string to create a broadcast message:
+The current project must be registered before writing. For direct messages, `targetProjectRemote` must also be registered before writing.
+
+Omit `targetProjectRemote`, pass `null`, or pass an empty string to create a broadcast message:
 
 ```json
 {
-  "currentProjectKey": "_mnt_d_workspace_backend",
+  "currentProjectRemote": "https://github.com/example/backend.git",
   "docKey": "release-note",
   "title": "Backend Release",
   "content": "Backend release is ready",
@@ -151,23 +194,27 @@ Supported formats are `markdown`, `text`, and `json`. The default format is `mar
 
 ### `read_unread_messages`
 
-Read unread inbox messages for the current project and mark the returned latest versions as read.
+Read unread inbox messages for the current project device and mark the returned latest versions as read for that device.
 
 ```json
 {
-  "currentProjectKey": "_mnt_d_workspace_frontend",
+  "currentProjectRemote": "git@github.com:example/frontend.git",
+  "deviceId": "server",
   "withBroadcast": true,
   "limit": 20
 }
 ```
 
+The current project and `deviceId` must be registered first with `register_project`.
+
 ### `list_messages`
 
-List latest inbox message summaries without changing read state.
+List latest inbox message summaries for the current project device without changing read state.
 
 ```json
 {
-  "currentProjectKey": "_mnt_d_workspace_frontend",
+  "currentProjectRemote": "git@github.com:example/frontend.git",
+  "deviceId": "server",
   "withBroadcast": true,
   "query": "users",
   "tags": ["api"],
@@ -181,7 +228,7 @@ Read version history for a message without changing read state.
 
 ```json
 {
-  "currentProjectKey": "_mnt_d_workspace_frontend",
+  "currentProjectRemote": "git@github.com:example/frontend.git",
   "messageId": 1,
   "withBroadcast": true,
   "limit": 10
@@ -192,8 +239,10 @@ Direct message history is visible to the sender and target project. Broadcast hi
 
 ## Typical Workflow
 
-1. Derive or choose the project key for each workspace.
-2. Have the sender call `upsert_message` with a stable `docKey`.
-3. Have the receiver call `read_unread_messages`.
-4. Use `list_messages` when you need search or status without marking anything read.
-5. Use `get_message_history` when you need prior versions of a message.
+1. Pick the current project's Git remote and a stable user/device-provided `deviceId`.
+2. Call `register_project` with the current remote and `deviceId` before any read or write.
+3. For direct messages, make sure the target remote is registered first. Use `list_projects` to check existing targets, or manually call `register_project` for the target remote.
+4. Send or update messages with `upsert_message` and a stable `docKey`.
+5. Read new messages with `read_unread_messages` when marking them read is acceptable.
+6. Use `list_messages` to search or inspect without marking anything read.
+7. Use `get_message_history` when prior versions of a message matter.

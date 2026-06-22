@@ -1,22 +1,31 @@
 # MCP Project Bridge 中文文档
 
-MCP Project Bridge 是一个通过 Streamable HTTP 运行的 MCP 服务，用本机 SQLite 在多个项目之间保存和读取消息。它适合多项目协作场景，例如一个项目把 API 约定、实现状态、交接说明或结构化备忘发送给另一个项目。
+MCP Project Bridge 是一个通过 Streamable HTTP 运行的 MCP 服务，用集中 SQLite 在已注册的 Git remote 项目之间保存和读取消息。它适合多项目、多设备协作场景，例如一个项目把 API 约定、实现状态、交接说明或结构化备忘发送给另一个项目。
 
 服务只写入自己的集中数据库，不会在被桥接的项目目录里生成文件。
 
 ## 核心逻辑
 
-每个项目用 project key 标识。你可以自己指定 project key，也可以用 `derive_project_key` 根据项目绝对路径生成稳定 key。
+项目用 Git remote 标识，不再用本地路径。项目必须先注册，之后才能发送、接收或查看消息。
+
+注册时，服务会把 Git remote 解析成 canonical key：
+
+- canonical key 是单个全小写字符串，格式类似 `host/namespace/project`。
+- 多级 namespace 会保留，例如 `github.com/org/team/repo`。
+- 数据库会保存首次注册时的原始 remote。
+- 后续注册同一个 canonical key 时，不会覆盖原始 remote 或项目描述。
+- key 不是别名系统。只有不同 remote 解析到同一个 canonical key 时，才会指向同一个项目。
 
 消息采用集中收件箱模型：
 
 - 定向消息包含发送方 project key、接收方 project key 和 `docKey`。
+- 定向消息的目标项目必须已注册，否则写入失败。
 - 广播消息包含发送方 project key 和 `docKey`，没有接收方 project key。
 - 同一个发送方、接收方和 `docKey` 再次写入时，会生成同一条消息的新版本。
 - 传入 `messageId` 可以更新指定消息，但只有发送方项目可以更新。
-- 已读状态按查看方 project key 和消息版本记录。
-- `read_unread_messages` 只会把本次返回的最新版本标记为已读。
-- 后续产生的新版本会重新变成未读。
+- 已读状态按查看方 project key、`deviceId` 和消息版本记录。
+- `read_unread_messages` 只会把本次返回的最新版本标记为该设备已读。
+- 后续产生的新版本会重新变成该设备未读。
 
 普通收件箱默认不包含广播消息。需要传 `withBroadcast: true` 才会读取广播。
 
@@ -50,7 +59,7 @@ node dist/index.js
 服务默认监听 `127.0.0.1:3000`，MCP 端点是 `/mcp`。
 请把 MCP 客户端配置为 Streamable HTTP 端点，例如 `http://127.0.0.1:3000/mcp`，并在每个请求中发送 `Authorization: Bearer change-me`。
 
-HTTP 传输是无状态的：服务不会创建 MCP session，不会返回 `MCP-Session-Id`，也不提供独立的 GET SSE 流。普通请求响应使用 `Content-Type: application/json`。CORS 对浏览器客户端开放为 `Access-Control-Allow-Origin: *`；鉴权仍然依赖 Bearer token。
+HTTP 传输是无状态的：服务不会创建 MCP session，不会返回 `MCP-Session-Id`，也不提供独立的 GET SSE 流。普通请求响应使用 `Content-Type: application/json`。`GET /mcp` 和 `DELETE /mcp` 返回 `405`。CORS 对浏览器客户端开放为 `Access-Control-Allow-Origin: *`；鉴权仍然依赖 Bearer token，不使用 cookie/credentials。
 
 可选环境变量：
 
@@ -91,31 +100,63 @@ docker run --rm \
 
 镜像默认设置 `MCP_PROJECT_BRIDGE_DB=/data/bridge.sqlite` 和 `MCP_PROJECT_BRIDGE_HOST=0.0.0.0`。挂载 `/data` 后，容器重启不会丢失消息，并可按需映射容器端口。HTTP 端点是 `http://<host>:3000/mcp`。
 
-## Project Key 规则
+## Remote Key 规则
 
-`derive_project_key` 会先把 Windows 盘符路径转换成 WSL 风格路径，再把路径分隔符替换成下划线。
+调用工具时传 Git remote URL。服务会把它 canonicalize 成项目 key 并保存。
 
 示例：
 
 ```text
-D:\mcp\api -> /mnt/d/mcp/api -> _mnt_d_mcp_api
-C:/work\frontend -> /mnt/c/work/frontend -> _mnt_c_work_frontend
-/home/me/web -> _home_me_web
+https://github.com/Org/Repo.git -> github.com/org/repo
+git@github.com:Org/Repo.git -> github.com/org/repo
+ssh://git@github.com/org/team/Repo.git -> github.com/org/team/repo
 ```
 
-Project key 只是消息标识，不需要提前注册。
+规则：
+
+- remote 必须包含 host、namespace 和 project。
+- canonical key 全小写，保留 `/` 分隔。
+- 数据库只在首次注册项目时保存原始 remote 字符串。
+- 工具入参使用 `currentProjectRemote`、`targetProjectRemote` 这类 remote 字段；调用方应传 remote，不应传本地路径或旧的路径型 key。
 
 ## 工具说明
 
-### `derive_project_key`
+### `register_project`
 
-根据项目绝对路径生成稳定 project key，不写入数据库。
+注册 Git remote 项目，并可选地 upsert 当前设备。
 
 ```json
 {
-  "path": "D:\\workspace\\backend"
+  "remote": "https://github.com/example/backend.git",
+  "deviceId": "desktop",
+  "projectDescription": "Backend service",
+  "deviceDescription": "Windows desktop"
 }
 ```
+
+`deviceId` 是可选的。发送定向消息前注册目标项目时，可以只传 `remote` 和 `projectDescription`。
+
+```json
+{
+  "remote": "git@github.com:example/frontend.git",
+  "projectDescription": "Frontend app"
+}
+```
+
+首次注册会保存项目 remote 和项目描述。后续注册同一个 canonical key 时，只会在提供 `deviceId` 时 upsert 设备信息。
+
+### `list_projects`
+
+列出已注册项目和设备摘要。用它查询当前服务中有哪些可用的定向目标。
+
+```json
+{
+  "query": "frontend",
+  "limit": 20
+}
+```
+
+`query` 会匹配 canonical key、原始 remote 或项目描述。
 
 ### `upsert_message`
 
@@ -123,8 +164,8 @@ Project key 只是消息标识，不需要提前注册。
 
 ```json
 {
-  "currentProjectKey": "_mnt_d_workspace_backend",
-  "targetProjectKey": "_mnt_d_workspace_frontend",
+  "currentProjectRemote": "https://github.com/example/backend.git",
+  "targetProjectRemote": "git@github.com:example/frontend.git",
   "docKey": "users-api",
   "title": "Users API",
   "content": "GET /users\nPOST /users",
@@ -133,11 +174,13 @@ Project key 只是消息标识，不需要提前注册。
 }
 ```
 
-省略 `targetProjectKey`、传 `null` 或传空字符串会创建广播消息：
+写入前，当前项目必须已注册。对于定向消息，`targetProjectRemote` 也必须已注册。
+
+省略 `targetProjectRemote`、传 `null` 或传空字符串会创建广播消息：
 
 ```json
 {
-  "currentProjectKey": "_mnt_d_workspace_backend",
+  "currentProjectRemote": "https://github.com/example/backend.git",
   "docKey": "release-note",
   "title": "Backend Release",
   "content": "Backend release is ready",
@@ -149,23 +192,27 @@ Project key 只是消息标识，不需要提前注册。
 
 ### `read_unread_messages`
 
-读取当前项目未读消息，并把返回的最新版本标记为已读。
+读取当前项目设备的未读消息，并把返回的最新版本标记为该设备已读。
 
 ```json
 {
-  "currentProjectKey": "_mnt_d_workspace_frontend",
+  "currentProjectRemote": "git@github.com:example/frontend.git",
+  "deviceId": "server",
   "withBroadcast": true,
   "limit": 20
 }
 ```
 
+当前项目和 `deviceId` 必须先通过 `register_project` 注册。
+
 ### `list_messages`
 
-列出当前项目收件箱里的最新消息摘要，不改变已读状态。
+列出当前项目设备收件箱里的最新消息摘要，不改变已读状态。
 
 ```json
 {
-  "currentProjectKey": "_mnt_d_workspace_frontend",
+  "currentProjectRemote": "git@github.com:example/frontend.git",
+  "deviceId": "server",
   "withBroadcast": true,
   "query": "users",
   "tags": ["api"],
@@ -179,7 +226,7 @@ Project key 只是消息标识，不需要提前注册。
 
 ```json
 {
-  "currentProjectKey": "_mnt_d_workspace_frontend",
+  "currentProjectRemote": "git@github.com:example/frontend.git",
   "messageId": 1,
   "withBroadcast": true,
   "limit": 10
@@ -190,8 +237,10 @@ Project key 只是消息标识，不需要提前注册。
 
 ## 常用流程
 
-1. 为每个工作区生成或指定 project key。
-2. 发送方用稳定的 `docKey` 调用 `upsert_message`。
-3. 接收方调用 `read_unread_messages` 读取未读消息。
-4. 需要搜索或查看状态但不想标记已读时，使用 `list_messages`。
-5. 需要查看历史版本时，使用 `get_message_history`。
+1. 确定当前项目 Git remote，并使用用户主动指定的稳定 `deviceId`。
+2. 任何读写操作前，先用当前 remote 和 `deviceId` 调用 `register_project`。
+3. 发送定向消息前，确认目标 remote 已注册。可以用 `list_projects` 查询，也可以手动对目标 remote 调用 `register_project`。
+4. 用稳定的 `docKey` 调用 `upsert_message` 发送或更新消息。
+5. 可以标记已读时，用 `read_unread_messages` 读取新消息。
+6. 只想搜索或查看状态、不想标记已读时，用 `list_messages`。
+7. 需要查看历史版本时，用 `get_message_history`。
